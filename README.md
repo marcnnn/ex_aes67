@@ -46,14 +46,17 @@ tests are written from memory.
 | `RTL.Slots` | slot word layout and address math shared by ring and buffer | |
 | `RTL.Interfaces` | stream interface definitions and the expected `ex_net` / `ex_ptp` signals | |
 
-Interfaces expected from the siblings (they are not dependencies, see
-`ExAes67.RTL.Interfaces` and `NEEDS.md`):
+Interfaces to the siblings (ex_net and ex_ptp are path dependencies; the definitions live
+with the producers: `ExNet.RTL.Ifc`, `ExPtp.RTL.Ifc`; `ExAes67.RTL.Interfaces` documents them
+from this side):
 
 * UDP payload AXI4-Stream, 64 bit, byte 0 in `tdata[7:0]`; RX `tuser` is
   `{payload length 16, source IP 32, destination port 16, destination IP 32}`
-  (LSB last), valid on the first beat; TX `tuser` is `{length 16, port 16, IP 32}`
-  on every beat.
-* Media clock `{tick, rtp_ts}`: a one cycle `tick` per 48 kHz sample period and
+  (LSB last), constant over the packet (`ExNet.RTL.UdpRx` produces it, whole packets only);
+  TX `tuser` is `{length 16, port 16, IP 32}` on every beat (`ExNet.RTL.UdpTx` consumes it;
+  put `ExNet.RTL.TxPath` in front of a MAC, the packetiser's output has gaps).
+* Media clock `{tick, rtp_ts}` (`ExPtp.RTL.Ifc.media_clock/2`, produced by
+  `ExPtp.RTL.MediaNco`): a one cycle `tick` per 48 kHz sample period and
   the 32 bit media time of that period, changing with the tick.
 * Control: a write bus `cfg_we/cfg_sel/cfg_addr/cfg_data` per module, built from
   the model stream maps by `RTL.Program.rx/2` and `RTL.Program.tx/2`.
@@ -130,6 +133,29 @@ excluded automatically when `verilator` is not in `PATH`).
 * `e2e_test`: RTL packetiser, network with reorder, loss, duplicates, RTL
   receive path; every scenario of `E2ETest`, with the receive path also run
   through the models on the same arrivals (frames and counters equal).
+
+`test/integration/` wires the three libraries together on one clock (the tops are in
+`test/support/chains.ex`; the BEAM simulator runs about 25 cycles per second on the
+receive chain, so the scenarios are short; the clock is scaled so that a sample period is
+192 cycles; `INTEG_CACHE=1` keeps a simulation result between runs while editing a check):
+
+* `rx_chain_test`: XGMII words -> `ExNet.RTL.MacRx` -> `Classifier` -> `UdpRx` -> `Depacketiser`
+  -> `JitterBuffer`, media clock from `ExPtp.RTL.MediaNco`, and the same frames through
+  `ExPtp.RTL.RxStamp` with the `TimestampUnit`. Random AES67 streams (L16 and L24, 1 to 3
+  frames per packet, wrong payload type), PTP Sync / Delay_Req / Follow_Up over UDP and L2,
+  ARP and other UDP, 0 to 2 VLAN tags, IP options, Ethernet padding, bad FCS, Start in lane 0
+  and 4. Checked: the jitter buffer frames and counters equal the models fed with the same
+  arrivals (the ticks and `rtp_ts` observed on the chain), `rtp_ts` equals the wallclock model's
+  media time, the depacketiser's drop counters, and for every frame the bytes, the PTP
+  classification (`PtpDetect.classify/1`, `ExPtp.Message.decode/1`) and the timestamp (wallclock
+  model at the capture cycle minus the compensation, exact). The same stimulus is replayed in
+  Verilator (outputs identical on every cycle) and a 30 period scenario runs in Verilator
+  alone with the ticks predicted from the free-running media clock.
+* `tx_chain_test`: `Packetiser` and a PTP payload source -> `UdpTx` -> packet FIFOs -> merge ->
+  `TxInsert` -> `MacTx` -> XGMII, decoded with the MAC RX model. RTP packets equal the
+  packetiser model (bytes, order, addressing, IP id), Sync / Delay_Req / Follow_Up equal what
+  was sent (Sync with the origin timestamp the wallclock model has at the Start word),
+  and the timestamp unit reports for every frame the same time with its tag. Replayed in Verilator.
 
 ## API overview
 
@@ -240,3 +266,41 @@ mix test
 
 `mix test` runs on loopback only. `ex_net` and `ex_ptp` are not dependencies
 yet. The RTL tests take about a minute (Verilator builds are cached).
+
+## Interop
+
+`mix test --only interop` runs the codecs against real implementations (excluded from
+`mix test`). Needs rootless podman and network access for the image build and the Wireshark
+sample captures (cached in `$TMPDIR/ex_interop_captures`; a failed download skips the test).
+Containers share a podman network (`ex-interop`, created on demand); the BEAM side runs in an
+Elixir container with `_build/<env>/lib` mounted, so `mix test` compiles first.
+
+```sh
+containers/build.sh            # tshark, gstreamer, pipewire, nettools (tcpdump), debian trixie, arm64 or amd64
+mix test --only interop        # about 5 minutes
+```
+
+| Test | Against | Result |
+|---|---|---|
+| `tshark_test.exs` | Wireshark 4.4 (tshark `-T json`): RTP L16/L24 (marker, 16 bit sequence wrap, CSRC, extension, padding), RTCP SR/RR/SDES/BYE, SAP announce and delete with an AES67 SDP, mDNS/DNS-SD query and response, RTSP DESCRIBE with SDP body | no malformed packets or expert warnings; every field equal; Wireshark learns the payload type 98 mapping from the SDP in the SAP packet |
+| `tshark_test.exs`, reverse | sample captures `sip-rtp-l16.pcap` (1641 RTP packets), `RTP_L16_monaural_sample.pcapng` (2068), `mDNS1.zip` (3 DNS messages), `RTSPPACKETS1.cap` (5 messages), against tshark's view | `RTP.decode`, `DNS.decode`, `RTSP.parse` agree on all fields |
+| `gstreamer_test.exs` | GStreamer 1.26 `rtpL24pay`/`rtpL16pay` and `depay`, 48 kHz stereo, 1 ms packets, multicast | ExAes67 to GStreamer: 3000 packets of a sample counter come out of `rtpL24depay` and `rtpL16depay` unchanged. GStreamer to ExAes67 (tcpdump in the sender's namespace): payload type 98, one SSRC, sequence +1 and timestamp +48 on 99 % of steps, 288 or 192 byte payloads, a 1 kHz half scale sine within 2 LSB. `rtpbin` RTCP: SR with packet and octet counts equal to the RTP stream (288 bytes per packet), NTP time, SDES CNAME and TOOL decode |
+| `pipewire_test.exs` | PipeWire 1.4.2 with WirePlumber, `module-rtp-sap`, `module-rtp-source`, `module-rtp-sink`, null sink | ExAes67 `SDP`, `SAP` and `RTP` to PipeWire: PipeWire creates a receiver node from the SAP announcement ("ExAes67 test", `Stream/Output/Audio`) and records the 1 kHz tone. PipeWire to ExAes67: the SAP announcement of its RTP sink parses with `SAP.decode`, `SDP.parse`, `SDP.streams` (L24/48000/2, ptime 1, framecount 48, ts-refclk gmid, source-filter), the RTP packets decode with `RTP.decode` and `Payload.unpack`, every sample is a value of the sent sine, and tshark finds nothing malformed in the same capture |
+
+What was not possible or is weaker than it looks:
+
+- No PTP: the SDP carries `ts-refclk` and `mediaclk:direct`, but nothing here checks media clock
+  alignment. PipeWire's receiver resamples to the sender's (BEAM paced) clock.
+- PipeWire runs without realtime scheduling in a rootless container on a shared host. At a 1 ms
+  graph cycle its null sink and `pw-cat` glitch (phase slips and short silences in the audio, not in
+  RTP sequence or timestamps), at 4 ms (`support/pipewire/quantum-192.conf`) less often.
+  The PipeWire checks therefore test the tone (zero crossing rate between 1200 and 2100 per second, level, that
+  all sent sample values and nothing else arrive) and not the sample order. `pw-cat` has no packed
+  24 bit format, it records and plays `s32`.
+- PipeWire's `rtp-sink` sends payload type 127 (the SDP says so) and `a=recvonly` for a sending
+  stream; both parse fine.
+- `aes67-linux-daemon` was not tried: it needs the Ravenna ALSA driver and a PTP clock.
+- Wireshark's RTP dissector needs the SDP seen first (SAP packet in the capture) or
+  `rtp.heuristic_rtp` for dynamic payload types.
+- Findings: none in `lib/`, see NEEDS.md ("Interop findings").
+

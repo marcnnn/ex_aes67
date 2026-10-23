@@ -19,9 +19,15 @@ defmodule ExAes67.MixProject do
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
+  # SIBLINGS_DIR points the path deps at another checkout of the siblings,
+  # e.g. a snapshot of their last commits while they are being edited.
+  @siblings System.get_env("SIBLINGS_DIR", "..")
+
   defp deps do
     [
-      {:ex_hdl, path: "../exhdl"},
+      {:ex_hdl, path: Path.join(@siblings, "exhdl")},
+      {:ex_net, path: Path.join(@siblings, "ex_net")},
+      {:ex_ptp, path: Path.join(@siblings, "ex_ptp")},
       {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]
   end

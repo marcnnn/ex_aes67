@@ -14,19 +14,17 @@ Nothing blocks the BEAM side or the models. For the hardware step:
 
 ## ex_net
 
-* IPv4/UDP receive parser that tolerates 802.1Q and IP options (CRIT-01) and
-  hands `{dst_ip, dst_port, udp_payload}` to the depacketiser. The model
-  takes exactly that triple.
-* UDP/IPv4/Ethernet framing for TX with multicast MAC derived from the
-  destination IP; the packetiser model emits `udp_payload` only.
-* IGMP join/leave controlled from the BEAM (SDP session start/stop).
+* Resolved (`ExNet.RTL.UdpRx`): IPv4/UDP receive path that tolerates 802.1Q and IP options and
+  hands the depacketiser the UDP payload with `{dst_ip, dst_port, src_ip, len}`.
+* Resolved (`ExNet.RTL.UdpTx`, `TxPath`): UDP/IPv4/Ethernet framing for TX with the multicast MAC
+  derived from the destination IP.
+* Open: IGMP join/leave controlled from the BEAM (SDP session start/stop).
 
 ## ex_ptp
 
-* Media clock: a function from the PTP wall clock to the 32 bit RTP
-  timestamp domain at 48 kHz (and the current `mediaclk:direct` offset), so
-  the jitter buffer `now` and the packetiser `now` have a defined source.
-* Grandmaster identity and domain readout for `a=ts-refclk`
+* Resolved (`ExPtp.RTL.MediaNco`, `ExPtp.RTL.Ifc.media_clock/2`): media clock from the PTP wall clock
+  to the 32 bit RTP timestamp domain, with the `mediaclk:direct` offset.
+* Open: grandmaster identity and domain readout for `a=ts-refclk`
   (`SDP.Stream.ptp_refclk/2` takes the 8 byte gmid and the domain).
 
 # Hardware step (wave 2): what the RTL modules expect and what was missing
@@ -91,31 +89,63 @@ Each item is a gap that cost a workaround in this library.
 
 ## ex_net (classifier and TX path)
 
-* RX: AXI4-Stream, 64 bit, byte 0 in `tdata[7:0]`, `tuser` (96 bit) valid on
-  the first beat: `[31:0]` destination IP, `[47:32]` destination port,
-  `[79:48]` source IP, `[95:80]` UDP payload length. UDP checksum verified,
-  only joined multicast groups or unicast to us. Backpressure is honoured but
-  put a FIFO of a few packets in front (the depacketiser has two 2 KB banks).
-* TX: the same stream with a 64 bit `tuser`, valid on every beat of a packet:
-  `[31:0]` destination IP, `[47:32]` destination port, `[63:48]` UDP payload
-  length. `ex_net` adds UDP, IPv4, the multicast MAC derived from the IP and
-  the Ethernet framing. One packet at a time, `tready` may stall.
-* IGMP join/leave per stream from the BEAM (unchanged from above).
+All of this is `ExNet.RTL.Ifc` now and is built and tested end to end (`test/integration/`):
+
+* RX: AXI4-Stream, 64 bit, byte 0 in `tdata[7:0]`, `tuser` (96 bit) constant over the packet:
+  `[31:0]` destination IP, `[47:32]` destination port, `[79:48]` source IP, `[95:80]` UDP payload
+  length. Only joined multicast groups or unicast to us (the classifier table), only whole packets
+  with a good FCS. Deviation from the wish: the UDP checksum is not verified (the Ethernet FCS
+  is; AES67 senders use checksum 0). Backpressure: `UdpRx` has a 512 beat packet FIFO that
+  drops whole packets when full (`drop_full`), the depacketiser's two banks sit behind it.
+* TX: the same stream with a 64 bit `tuser` valid on every beat: `[31:0]` destination IP,
+  `[47:32]` destination port, `[63:48]` UDP payload length; `UdpTx` adds UDP, IPv4 (TTL, TOS,
+  source address and port from inputs), the multicast MAC and the Ethernet framing; `tready` may
+  stall and `tvalid` may pause, a packet FIFO (`TxPath`) makes the MAC stream gapless.
+* IGMP join/leave per stream from the BEAM: open.
 
 ## ex_ptp (media clock)
 
-* `tick` (one cycle pulse per 48 kHz sample period) and `rtp_ts` (32 bit media
-  time of the period starting at the tick, changes with the tick, stable
-  until the next one), in the clock domain of the RTP modules (CDC done in
-  `ex_ptp`). Ticks at least `channels + 16` cycles apart for the jitter
-  buffer, and a continuous `rtp_ts` (steps: the tags make the jitter buffer
-  play silence, as the model does, but nothing flushes it).
-* The per stream `mediaclk:direct` offset is a table field here, so `ex_ptp`
-  only provides the common counter.
+Resolved: `ExPtp.RTL.MediaNco` (ports `tick`, `rtp_ts`, `ExPtp.RTL.Ifc.media_clock/2`) feeds the
+jitter buffer and the packetiser in the chains. `tick` and `rtp_ts` change in the same cycle,
+ticks are every 192 cycles in the tests (the contract is at least `channels + 16`). A step of
+`rtp_ts` after a wallclock step and `align` makes the jitter buffer play silence for the old
+slots, as before; nothing flushes it. The per stream `mediaclk:direct` offset stays a table field.
 
 ## ex_hdl_cores
 
-* A packet FIFO (store and forward, a few KB) in front of
-  `Depacketiser`'s `s_axis` when the classifier can burst at line rate.
+* Resolved: the packet FIFO in front of `Depacketiser` is `ExHdlCores.FIFO.packet/1` inside
+  `ExNet.RTL.UdpRx` (it also drops bad frames); `TxPath` uses it again on the TX side, with
+  `AXIS.merge/2` as the arbiter.
 * AXI-Lite to the `cfg_we/cfg_sel/cfg_addr/cfg_data` bus (write only) plus a
   read path for `stat_addr/stat_lane/stat_data`; `ex_pcie` would sit behind it.
+
+## Interop findings
+
+Run against Wireshark 4.4.19, GStreamer 1.26.2 and PipeWire 1.4.2 in containers (README "Interop").
+
+- No protocol bug found in `ExAes67.RTP`, `RTCP`, `SDP`, `SAP`, `DNS`, `RTSP`, `SAP.Server`: packets
+  built by the library dissect cleanly in Wireshark with equal fields; GStreamer depayloads
+  them bit exactly and PipeWire creates a receiver from the SAP announcement; GStreamer's RTP and
+  RTCP and PipeWire's RTP and SAP/SDP (including `a=source-filter: incl ...` with a space after the
+  colon, `a=ssrc`, `a=type`, media level `i=`) decode with the library.
+- Not covered: PTP locked media clocks (`ts-refclk` is parsed but there is no clock to check),
+  `ExAes67.MDNS` and `ExAes67.RTSP.Server` against a real peer (only the codecs against Wireshark's
+  dissectors and sample captures; Avahi and an RTSP client are the next candidates), RTCP receiver
+  reports into a real sender, ptime below 1 ms (the BEAM sender cannot pace 125 us packets
+  reliably, so the interop sender uses 1 ms), aes67-linux-daemon.
+- `ExAes67.SAP.Server.announce/3` returns the message id (a number), the docs say nothing about the
+  return value; the interop sender ignores it.
+
+
+## Wave 3 status (interop, integration)
+
+* Full `mix test` exceeds 200 s on this shared host; last run reached two
+  failures in `DiscoveryTest` (RTSP raw, SAP on loopback) before timing out.
+  Not yet triaged: may be loopback/multicast limits of the host.
+* `SIBLINGS_DIR` in `mix.exs` lets the suite run against a snapshot of the
+  siblings (`git archive HEAD`) while they are edited. The committed
+  siblings lack `ExPtp.RTL.Ifc` and `ExNet.RTL.UdpRx/UdpTx`, so the RTL
+  tests need their working copies until those land.
+* Interop (`test/interop/`, tagged `:interop`, excluded by default): tshark
+  decode, PipeWire SDP and GStreamer L24 round trip are scaffolded but not
+  run to completion; the PipeWire null sink recording step is unfinished.

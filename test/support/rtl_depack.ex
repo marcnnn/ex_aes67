@@ -9,7 +9,14 @@ defmodule ExAes67.RTLDepack do
   @doc "AXI4-Stream beats of a UDP payload: `{tdata, tkeep, tlast, tuser}`."
   def beats(dst_ip, dst_port, payload) do
     len = byte_size(payload)
-    tuser = Program.ip(dst_ip) ||| dst_port <<< 32 ||| len <<< 80
+
+    tuser =
+      ExNet.RTL.Ifc.pack_udp_rx(%{
+        dst_ip: Program.ip(dst_ip),
+        dst_port: dst_port,
+        src_ip: 0,
+        len: len
+      })
 
     chunks = for <<c::binary-size(8) <- payload>>, do: c
     rest = binary_part(payload, length(chunks) * 8, rem(len, 8))

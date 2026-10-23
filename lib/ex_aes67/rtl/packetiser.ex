@@ -97,8 +97,7 @@ defmodule ExAes67.RTL.Packetiser do
     name = "aes67_pack_#{streams}_#{n}x#{depth}_t#{tag}_#{style}"
 
     module name do
-      tick = input(:tick, 1)
-      rtp_ts = input(:rtp_ts, 32)
+      %{tick: tick, rtp_ts: rtp_ts} = ExPtp.RTL.Ifc.media_clock(:slave)
       in_valid = input(:in_valid, 1)
       in_ch = input(:in_ch, 11)
       in_data = input(:in_data, s(24))

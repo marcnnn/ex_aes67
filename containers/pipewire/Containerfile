@@ -1,0 +1,6 @@
+# PipeWire with the RTP/SAP modules, no session manager (nodes are linked with pw-link).
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      pipewire pipewire-bin pipewire-audio libspa-0.2-modules iproute2 dbus \
+ && rm -rf /var/lib/apt/lists/*

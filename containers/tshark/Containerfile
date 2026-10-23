@@ -1,0 +1,7 @@
+# Wireshark command line dissector for the interop tests (arm64 or amd64).
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update \
+ && echo "wireshark-common wireshark-common/install-setuid boolean false" | debconf-set-selections \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["tshark"]

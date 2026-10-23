@@ -59,8 +59,7 @@ defmodule ExAes67.RTL.JitterBuffer do
       wr_ch = input(:wr_ch, 11)
       wr_ts = input(:wr_ts, 32)
       wr_data = input(:wr_data, s(24))
-      tick = input(:tick, 1)
-      rtp_ts = input(:rtp_ts, 32)
+      %{tick: tick, rtp_ts: rtp_ts} = ExPtp.RTL.Ifc.media_clock(:slave)
       latency = input(:latency, sl.idx_w)
 
       out_valid = output(:out_valid, 1, reset: 0)

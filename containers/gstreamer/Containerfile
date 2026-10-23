@@ -1,0 +1,6 @@
+# GStreamer RTP stack (rtpL16/L24 pay and depay, rtpbin) for the AES67 interop tests.
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good iproute2 \
+ && rm -rf /var/lib/apt/lists/*
