@@ -72,13 +72,21 @@ defmodule ExAes67.RTL.Program do
   stream configs, table position = stagger index). `now` is the media time at
   which the packetiser starts; every stream's first packet starts at the next
   multiple of its samples per packet, as in the model.
+
+  A stream is disabled first and enabled by the last write, so a write
+  sequence that is slower than a packet period (AXI4-Lite through clock
+  domain crossings) never lets the scheduler see a half written entry.
   """
   def tx(configs, now \\ 0) do
+    lanes = for {c, i} <- Enum.with_index(configs), do: {i, tx_lanes(c, i)}
+    lane = fn i, l, data -> %{cfg_we: 1, cfg_sel: 0, cfg_addr: 8 * i + l, cfg_data: data} end
+
+    disable = for {i, [_, l1 | _]} <- lanes, do: lane.(i, 1, l1 &&& bnot(1 <<< 24))
+
     cfg_writes =
-      for {c, i} <- Enum.with_index(configs),
-          {data, lane} <- Enum.with_index(tx_lanes(c, i)) do
-        %{cfg_we: 1, cfg_sel: 0, cfg_addr: 8 * i + lane, cfg_data: data}
-      end
+      for {i, ls} <- lanes, {data, l} <- Enum.with_index(ls), l != 1, do: lane.(i, l, data)
+
+    enable = for {i, [_, l1 | _]} <- lanes, do: lane.(i, 1, l1)
 
     state_writes =
       for {c, i} <- Enum.with_index(configs),
@@ -86,7 +94,7 @@ defmodule ExAes67.RTL.Program do
         %{cfg_we: 1, cfg_sel: 1, cfg_addr: 2 * i + lane, cfg_data: data}
       end
 
-    cfg_writes ++ state_writes
+    disable ++ cfg_writes ++ state_writes ++ enable
   end
 
   defp spp(c) do

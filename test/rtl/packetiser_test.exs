@@ -131,4 +131,62 @@ defmodule ExAes67.RTL.PacketiserTest do
     r = compare(cfgs, &sample/2, ticks: 30, ready: 70, depth: 32, seed: 4)
     assert RTLDrv.cosim(r.drv) == :ok
   end
+
+  test "configuration written slower than a packet period never sends a half written stream" do
+    alias ExAes67.RTL.{Packetiser, Program}
+    import Bitwise
+
+    cfg = %{
+      id: :out,
+      channels: 4,
+      base_channel: 0,
+      ptime_us: 125,
+      format: :l24,
+      pt: 98,
+      ssrc: 0xA67,
+      dst_ip: {239, 69, 2, 1},
+      dst_port: 5004
+    }
+
+    now = 48_000_600
+    d = RTLDrv.new(Packetiser.build(streams: 4, channels: 8, depth: 16))
+    d = RTLDrv.set(d, %{m_axis_tready: 1})
+
+    # one media tick between consecutive writes, as over AXI4-Lite and a clock crossing
+    {d, t, users} =
+      Enum.reduce(Program.tx([cfg], now), {d, now, []}, fn w, {d, t, us} ->
+        d = d |> RTLDrv.set(w) |> RTLDrv.step() |> RTLDrv.set(%{cfg_we: 0})
+        d = d |> RTLDrv.set(%{tick: 1, rtp_ts: t &&& 0xFFFFFFFF}) |> RTLDrv.step()
+        d = RTLDrv.set(d, %{tick: 0})
+
+        {d, us} =
+          Enum.reduce(1..60, {d, us}, fn _, {d, us} ->
+            us =
+              if RTLDrv.peek(d, :m_axis_tvalid) == 1 and RTLDrv.peek(d, :m_axis_tlast) == 1,
+                do: [RTLDrv.peek(d, :m_axis_tuser) >>> 48 | us],
+                else: us
+
+            {RTLDrv.step(d), us}
+          end)
+
+        {d, t + 1, us}
+      end)
+
+    {_d, users} =
+      Enum.reduce(t..(t + 20), {d, users}, fn t, {d, us} ->
+        d = d |> RTLDrv.set(%{tick: 1, rtp_ts: t}) |> RTLDrv.step() |> RTLDrv.set(%{tick: 0})
+
+        Enum.reduce(1..60, {d, us}, fn _, {d, us} ->
+          us =
+            if RTLDrv.peek(d, :m_axis_tvalid) == 1 and RTLDrv.peek(d, :m_axis_tlast) == 1,
+              do: [RTLDrv.peek(d, :m_axis_tuser) >>> 48 | us],
+              else: us
+
+          {RTLDrv.step(d), us}
+        end)
+      end)
+
+    # 6 samples x 4 channels x 3 bytes + 12 byte RTP header
+    assert users != [] and Enum.all?(users, &(&1 == 84))
+  end
 end
