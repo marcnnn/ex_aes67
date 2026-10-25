@@ -18,7 +18,8 @@ Nothing blocks the BEAM side or the models. For the hardware step:
   hands the depacketiser the UDP payload with `{dst_ip, dst_port, src_ip, len}`.
 * Resolved (`ExNet.RTL.UdpTx`, `TxPath`): UDP/IPv4/Ethernet framing for TX with the multicast MAC
   derived from the destination IP.
-* Open: IGMP join/leave controlled from the BEAM (SDP session start/stop).
+* Resolved (`ExNet.RTL.Igmp`, `ExNet.IGMP.Host`): IGMP join/leave controlled from the BEAM through a
+  command port; `aes67_card` joins when an RX stream is added and leaves when it is removed.
 
 ## ex_ptp
 
@@ -101,7 +102,8 @@ All of this is `ExNet.RTL.Ifc` now and is built and tested end to end (`test/int
   `[47:32]` destination port, `[63:48]` UDP payload length; `UdpTx` adds UDP, IPv4 (TTL, TOS,
   source address and port from inputs), the multicast MAC and the Ethernet framing; `tready` may
   stall and `tvalid` may pause, a packet FIFO (`TxPath`) makes the MAC stream gapless.
-* IGMP join/leave per stream from the BEAM: open.
+* IGMP join/leave per stream from the BEAM: done (`ExNet.RTL.Igmp`; the card's `Aes67Card.Host.Streams`
+  joins the destination group of each multicast RX stream and leaves it on removal).
 
 ## ex_ptp (media clock)
 
