@@ -304,3 +304,7 @@ What was not possible or is weaker than it looks:
   `rtp.heuristic_rtp` for dynamic payload types.
 - Findings: none in `lib/`, see NEEDS.md ("Interop findings").
 
+
+## License
+
+Apache-2.0, see `LICENSE`.
