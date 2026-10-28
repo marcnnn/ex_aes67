@@ -36,7 +36,7 @@ defmodule ExAes67.MixProject do
   # A sibling checkout (by default ../<app>) when there is one, otherwise the
   # GitHub repository. Inside deps/ always GitHub, so that every project in a
   # dependency tree picks the same source.
-  defp sibling(app, opts \\ []) do
+  defp sibling(app, opts) do
     {path, opts} = Keyword.pop(opts, :path, "../#{app}")
     nested? = Path.basename(Path.dirname(__DIR__)) == "deps"
 
