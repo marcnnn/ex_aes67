@@ -26,10 +26,22 @@ defmodule ExAes67.MixProject do
 
   defp deps do
     [
-      {:ex_hdl, path: Path.join(@siblings, "exhdl")},
-      {:ex_net, path: Path.join(@siblings, "ex_net")},
-      {:ex_ptp, path: Path.join(@siblings, "ex_ptp")},
+      sibling(:ex_hdl, path: Path.join(@siblings, "exhdl")),
+      sibling(:ex_net, path: Path.join(@siblings, "ex_net")),
+      sibling(:ex_ptp, path: Path.join(@siblings, "ex_ptp")),
       {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]
+  end
+
+  # A sibling checkout (by default ../<app>) when there is one, otherwise the
+  # GitHub repository. Inside deps/ always GitHub, so that every project in a
+  # dependency tree picks the same source.
+  defp sibling(app, opts \\ []) do
+    {path, opts} = Keyword.pop(opts, :path, "../#{app}")
+    nested? = Path.basename(Path.dirname(__DIR__)) == "deps"
+
+    if not nested? and File.dir?(Path.expand(path, __DIR__)),
+      do: {app, [path: path, override: true] ++ opts},
+      else: {app, [github: "marcnnn/#{app}"] ++ opts}
   end
 end
