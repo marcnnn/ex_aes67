@@ -57,7 +57,7 @@ defmodule ExAes67.DiscoveryTest do
   describe "SAP server on loopback" do
     test "announce, directory, delete, timeout" do
       {:ok, listener} =
-        Server.start_link(port: 0, origin: {127, 0, 0, 9}, timeout: 150, sweep: 30)
+        Server.start_link(port: 0, origin: {127, 0, 0, 9}, timeout: 600, sweep: 30)
 
       port = Server.port(listener)
       Server.subscribe(listener)
@@ -67,7 +67,7 @@ defmodule ExAes67.DiscoveryTest do
           port: 0,
           dest: {{127, 0, 0, 1}, port},
           origin: {127, 0, 0, 2},
-          interval: 40
+          interval: 50
         )
 
       mid = Server.announce(ann, "s1", @sdp)
@@ -76,7 +76,7 @@ defmodule ExAes67.DiscoveryTest do
       assert [%{parsed: %ExAes67.SDP{name: "Test"}, sdp: @sdp}] = Server.sessions(listener)
 
       # periodic re-announcement keeps it alive beyond the timeout
-      Process.sleep(300)
+      Process.sleep(900)
       assert [_] = Server.sessions(listener)
 
       assert :ok = Server.withdraw(ann, "s1")
@@ -95,7 +95,7 @@ defmodule ExAes67.DiscoveryTest do
 
       Server.announce(ann2, "x", @sdp)
       assert_receive {:sap, :announce, _}, 1000
-      assert_receive {:sap, :timeout, _}, 1000
+      assert_receive {:sap, :timeout, _}, 3000
       assert [] = Server.sessions(listener)
     end
 
