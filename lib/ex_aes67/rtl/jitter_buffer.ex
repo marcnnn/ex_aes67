@@ -1,12 +1,13 @@
 defmodule ExAes67.RTL.JitterBuffer do
   @moduledoc """
-  Timestamp addressed jitter buffer, the RTL of `ExAes67.Model.JitterBuffer`.
+  Timestamp-addressed jitter buffer synthesizing ExAes67.Model.JitterBuffer.
+  Expressed as an idiomatic functional state transformation.
 
-  ## Scheme
-
-  One slot per `{channel, ts mod depth}` holding `{valid, tag, sample}` (see
-  `ExAes67.RTL.Slots`), exactly the model's slots. A write is a
-  read-modify-write on port A (duplicate check), the playout scan reads
+  A dual-port RAM stores `channels * depth` audio samples. A write from
+  the network computes its slot address from `wr_ts` and `wr_ch`, reads
+  the existing slot on port A, and one cycle later either commits the
+  write or drops it, updating the diagnostic counters. Playout scans
+  channels `0..channels-1` on each `tick`, reading slots sequentially on
   port B, so the two never wait for each other except for a one cycle stall
   when both address the same word. The tag makes playout need no clearing:
   a slot is played only if its tag equals the frame timestamp, everything
@@ -38,7 +39,7 @@ defmodule ExAes67.RTL.JitterBuffer do
   Memory for 1024 channels x 64 frames: see `ExAes67.RTL.Slots` (8 URAM with
   `tag_bits: 11`, 16 with 32).
   """
-  use ExHdl.RTL
+  use ExHdl.Stateful
   alias ExAes67.RTL.Slots
 
   @stats ~w(written late overrun duplicate bad_channel underrun played tick_overrun)a
@@ -53,187 +54,163 @@ defmodule ExAes67.RTL.JitterBuffer do
     sl = Slots.new(n, depth, tag)
     name = "aes67_jb_#{n}x#{depth}_t#{tag}_#{style}"
 
-    module name do
-      io = declare_ports(sl)
-      mem = memory(:slots, width: sl.width, depth: sl.words, style: style, byte: sl.lane_w)
+    stateful name do
+      ports do
+        input :wr_valid, 1
+        output :wr_ready, 1
+        input :wr_ch, 11
+        input :wr_ts, 32
+        input :wr_data, s(24)
+        input :latency, sl.idx_w
+        input :tick, 1
+        input :rtp_ts, 32
+        output :out_valid, 1
+        output :out_ch, 10
+        output :out_data, s(24)
+        output :out_first, 1
+        output :out_last, 1
 
-      # Write stage: Port A read-modify-write
-      w = declare_write_stage(sl, mem, io)
-
-      # Playout stage: Port B channel scan
-      scan = declare_playout_stage(io)
-
-      # Write validation & collision avoidance
-      wr_eval = eval_write(n, depth, tag, w, scan)
-      {word, be} = Slots.write(sl, Slots.encode(sl, w.ts, w.data), w.ch)
-      write_port(mem, addr: w.addr, data: word, en: wr_eval.ok, be: be)
-
-      b_addr = wire(:b_addr, Slots.addr(sl, scan.play_ts, scan.ptr))
-      coll = wire(:coll, wr_eval.ok and w.addr == b_addr)
-      issue = wire(:issue, scan.scan and not coll)
-      b_rd = read_port(mem, addr: b_addr, en: issue, name: :b_rd)
-
-      {bv, btag, bdata} = Slots.fields(sl, Slots.pick(sl, b_rd, scan.s1_ch))
-      hit = wire(:hit, bv == 1 and btag == trunc(scan.play_ts, tag))
-
-      sync do
-        step_write_stage(w, io)
-        step_playout_stage(scan, issue, n)
-        drive_outputs(io, scan, hit, bdata, n)
-        update_statistics(io.st, w, wr_eval, scan, io.tick, hit, n)
-      end
-    end
-  end
-
-  defp declare_ports(sl) do
-    %{
-      wr_valid: input(:wr_valid, 1),
-      wr_ready: output(:wr_ready, 1),
-      wr_ch: input(:wr_ch, 11),
-      wr_ts: input(:wr_ts, 32),
-      wr_data: input(:wr_data, s(24)),
-      latency: input(:latency, sl.idx_w),
-      tick: input(:tick, 1),
-      rtp_ts: input(:rtp_ts, 32),
-      out_valid: output(:out_valid, 1, reset: 0),
-      out_ch: output(:out_ch, 10, reset: 0),
-      out_data: output(:out_data, s(24), reset: 0),
-      out_first: output(:out_first, 1, reset: 0),
-      out_last: output(:out_last, 1, reset: 0),
-      st: for(k <- @stats, into: %{}, do: {k, output(:"st_#{k}", 32, reset: 0)})
-    }
-  end
-
-  defp declare_write_stage(sl, mem, io) do
-    rtl do
-      w_busy = reg(:w_busy, 1)
-      w_ch = reg(:w_ch, 11)
-      w_ts = reg(:w_ts, 32)
-      w_data = reg(:w_data, 24)
-
-      io.wr_ready <~ not w_busy
-      accept = wire(:accept, io.wr_valid and not w_busy)
-
-      a_addr =
-        wire(:a_addr, mux(w_busy, Slots.addr(sl, w_ts, w_ch), Slots.addr(sl, io.wr_ts, io.wr_ch)))
-
-      a_rd = read_port(mem, addr: a_addr, en: accept, name: :a_rd)
-      {sv, stag, _} = Slots.fields(sl, Slots.pick(sl, a_rd, w_ch))
-
-      %{
-        busy: w_busy,
-        ch: w_ch,
-        ts: w_ts,
-        data: w_data,
-        accept: accept,
-        addr: a_addr,
-        sv: sv,
-        stag: stag
-      }
-    end
-  end
-
-  defp declare_playout_stage(io) do
-    rtl do
-      scan = reg(:scan, 1)
-      ptr = reg(:ptr, 11)
-      play_ts = reg(:play_ts, 32)
-      s1_valid = reg(:s1_valid, 1)
-      s1_ch = reg(:s1_ch, 11)
-
-      tick_go = wire(:tick_go, io.tick and not scan)
-      t_now = wire(:t_now, sub_wrap(io.rtp_ts, zext(io.latency, 32)))
-
-      %{
-        scan: scan,
-        ptr: ptr,
-        play_ts: play_ts,
-        s1_valid: s1_valid,
-        s1_ch: s1_ch,
-        tick_go: tick_go,
-        t_now: t_now
-      }
-    end
-  end
-
-  defp eval_write(n, depth, tag, w, scan) do
-    rtl do
-      playing = wire(:playing, scan.scan or scan.tick_go)
-      played = wire(:played, not playing or w.ch < scan.ptr)
-      floor = wire(:floor, add_wrap(mux(scan.scan, scan.play_ts, scan.t_now), zext(played, 32)))
-      d = wire(:d, as_signed(sub_wrap(w.ts, floor)))
-
-      bad = wire(:bad, w.ch >= n)
-      late = wire(:late, d < 0)
-      over = wire(:over, d >= depth)
-      dup = wire(:dup, w.sv == 1 and w.stag == trunc(w.ts, tag))
-      ok = wire(:ok, w.busy and not bad and not late and not over and not dup)
-
-      %{bad: bad, late: late, over: over, dup: dup, ok: ok}
-    end
-  end
-
-  defp step_write_stage(w, io) do
-    rtl do
-      w.busy <~ w.accept
-
-      if w.accept do
-        w.ch <~ io.wr_ch
-        w.ts <~ io.wr_ts
-        w.data <~ as_unsigned(io.wr_data)
-      end
-    end
-  end
-
-  defp step_playout_stage(scan, issue, n) do
-    rtl do
-      if scan.tick_go do
-        scan.scan <~ 1
-        scan.play_ts <~ scan.t_now
-      end
-
-      scan.s1_valid <~ issue
-
-      if issue do
-        scan.s1_ch <~ scan.ptr
-
-        if scan.ptr == n - 1 do
-          scan.scan <~ 0
-          scan.ptr <~ 0
-        else
-          scan.ptr <~ add_wrap(scan.ptr, 1)
+        for k <- @stats do
+          output :"st_#{k}", 32
         end
       end
-    end
-  end
 
-  defp drive_outputs(io, scan, hit, bdata, n) do
-    rtl do
-      io.out_valid <~ scan.s1_valid
-      io.out_ch <~ trunc(scan.s1_ch, 10)
-      io.out_first <~ (scan.s1_valid and scan.s1_ch == 0)
-      io.out_last <~ (scan.s1_valid and scan.s1_ch == n - 1)
-      io.out_data <~ as_signed(mux(hit and scan.s1_valid, bdata, 0))
-    end
-  end
+      state do
+        # Write stage
+        reg :w_busy, 1, reset: 0
+        reg :w_ch, 11, reset: 0
+        reg :w_ts, 32, reset: 0
+        reg :w_data, 24, reset: 0
 
-  defp update_statistics(st, w, wr_eval, scan, tick, hit, n) do
-    rtl do
-      events = [
-        bad_channel: w.busy and wr_eval.bad,
-        late: w.busy and not wr_eval.bad and wr_eval.late,
-        overrun: w.busy and not wr_eval.bad and not wr_eval.late and wr_eval.over,
-        duplicate:
-          w.busy and not wr_eval.bad and not wr_eval.late and not wr_eval.over and wr_eval.dup,
-        written: wr_eval.ok,
-        tick_overrun: tick and scan.scan,
-        underrun: scan.s1_valid and not hit,
-        played: scan.s1_valid and scan.s1_ch == n - 1
-      ]
+        # Playout scan stage
+        reg :scan, 1, reset: 0
+        reg :ptr, 11, reset: 0
+        reg :play_ts, 32, reset: 0
+        reg :s1_valid, 1, reset: 0
+        reg :s1_ch, 11, reset: 0
 
-      for {k, trigger} <- events do
-        if trigger, do: st[k] <~ add_wrap(st[k], 1)
+        # Registered outputs
+        reg :out_valid, 1, reset: 0
+        reg :out_ch, 10, reset: 0
+        reg :out_data, s(24), reset: 0
+        reg :out_first, 1, reset: 0
+        reg :out_last, 1, reset: 0
+
+        for k <- @stats do
+          reg :"st_#{k}", 32, reset: 0
+        end
       end
+
+      step(fn inputs, state ->
+        # Dual-port memory
+        mem = memory(:slots, width: sl.width, depth: sl.words, style: style, byte: sl.lane_w)
+
+        # 1. Playout Pipeline Stage Control
+        tick_go = inputs.tick and not state.scan
+        t_now = sub_wrap(inputs.rtp_ts, zext(inputs.latency, 32))
+
+        # 2. Write Ingestion & Candidate Read (Port A)
+        accept = inputs.wr_valid and not state.w_busy
+
+        a_addr =
+          wire(
+            :a_addr,
+            mux(
+              state.w_busy,
+              Slots.addr(sl, state.w_ts, state.w_ch),
+              Slots.addr(sl, inputs.wr_ts, inputs.wr_ch)
+            )
+          )
+
+        a_rd = read_port(mem, addr: a_addr, en: accept, name: :a_rd)
+        {sv, stag, _} = Slots.fields(sl, Slots.pick(sl, a_rd, state.w_ch))
+
+        # 3. Write Validation
+        playing = state.scan or tick_go
+        played = not playing or state.w_ch < state.ptr
+        floor = add_wrap(mux(state.scan, state.play_ts, t_now), zext(played, 32))
+        d = as_signed(sub_wrap(state.w_ts, floor))
+
+        bad = state.w_ch >= n
+        late = d < 0
+        over = d >= depth
+        dup = sv == 1 and stag == trunc(state.w_ts, tag)
+        ok = state.w_busy and not bad and not late and not over and not dup
+
+        # Commit Write to Memory Port A
+        {word, be} = Slots.write(sl, Slots.encode(sl, state.w_ts, state.w_data), state.w_ch)
+        write_port(mem, addr: a_addr, data: word, en: ok, be: be)
+
+        # 4. Playout Scan & Collision Avoidance (Port B)
+        b_addr = wire(:b_addr, Slots.addr(sl, state.play_ts, state.ptr))
+        coll = wire(:coll, ok and a_addr == b_addr)
+        issue = wire(:issue, state.scan and not coll)
+        b_rd = read_port(mem, addr: b_addr, en: issue, name: :b_rd)
+
+        {bv, btag, bdata} = Slots.fields(sl, Slots.pick(sl, b_rd, state.s1_ch))
+        hit = wire(:hit, bv == 1 and btag == trunc(state.play_ts, tag))
+
+        # 5. Pure Next State Computation (Registers)
+        next_w_busy = accept
+        next_w_ch = mux(accept, inputs.wr_ch, state.w_ch)
+        next_w_ts = mux(accept, inputs.wr_ts, state.w_ts)
+        next_w_data = mux(accept, as_unsigned(inputs.wr_data), state.w_data)
+
+        next_scan = mux(tick_go, 1, mux(issue and state.ptr == n - 1, 0, state.scan))
+        next_play_ts = mux(tick_go, t_now, state.play_ts)
+        next_ptr = mux(issue, mux(state.ptr == n - 1, 0, add_wrap(state.ptr, 1)), state.ptr)
+        next_s1_valid = issue
+        next_s1_ch = mux(issue, state.ptr, state.s1_ch)
+
+        next_out_valid = state.s1_valid
+        next_out_ch = trunc(state.s1_ch, 10)
+        next_out_first = state.s1_valid and state.s1_ch == 0
+        next_out_last = state.s1_valid and state.s1_ch == n - 1
+        next_out_data = as_signed(mux(hit and state.s1_valid, bdata, 0))
+
+        events = [
+          bad_channel: state.w_busy and bad,
+          late: state.w_busy and not bad and late,
+          overrun: state.w_busy and not bad and not late and over,
+          duplicate: state.w_busy and not bad and not late and not over and dup,
+          written: ok,
+          tick_overrun: inputs.tick and state.scan,
+          underrun: state.s1_valid and not hit,
+          played: state.s1_valid and state.s1_ch == n - 1
+        ]
+
+        next_stats =
+          for {k, trigger} <- events, into: %{} do
+            cur = Map.fetch!(state, :"st_#{k}")
+            {:"st_#{k}", mux(trigger, add_wrap(cur, 1), cur)}
+          end
+
+        # 6. Outputs and Next State
+        outputs = %{
+          wr_ready: not state.w_busy
+        }
+
+        next_state =
+          %{
+            w_busy: next_w_busy,
+            w_ch: next_w_ch,
+            w_ts: next_w_ts,
+            w_data: next_w_data,
+            scan: next_scan,
+            ptr: next_ptr,
+            play_ts: next_play_ts,
+            s1_valid: next_s1_valid,
+            s1_ch: next_s1_ch,
+            out_valid: next_out_valid,
+            out_ch: next_out_ch,
+            out_first: next_out_first,
+            out_last: next_out_last,
+            out_data: next_out_data
+          }
+          |> Map.merge(next_stats)
+
+        {outputs, next_state}
+      end)
     end
   end
 end
