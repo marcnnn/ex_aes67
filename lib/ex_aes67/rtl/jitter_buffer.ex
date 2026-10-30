@@ -151,10 +151,10 @@ defmodule ExAes67.RTL.JitterBuffer do
     s1_is_last = state.s1_ch == n - 1
 
     out_data =
-      match_cond([
-        {hit and state.s1_valid, bdata},
-        {:default, 0}
-      ])
+      match {state.s1_valid, hit} do
+        {1, 1} -> bdata
+        _ -> 0
+      end
 
     outputs = %{
       out_valid: state.s1_valid,
@@ -165,18 +165,24 @@ defmodule ExAes67.RTL.JitterBuffer do
     }
 
     scan_state =
-      match_cond([
-        {scan_ctrl.tick_go, %{scan: 1, play_ts: scan_ctrl.t_now, ptr: state.ptr}},
-        {issue and is_last, %{scan: 0, play_ts: state.play_ts, ptr: 0}},
-        {issue, %{scan: state.scan, play_ts: state.play_ts, ptr: add_wrap(state.ptr, 1)}},
-        {:default, %{scan: state.scan, play_ts: state.play_ts, ptr: state.ptr}}
-      ])
+      match {scan_ctrl.tick_go, issue, is_last} do
+        {1, _, _} -> %{scan: 1, play_ts: scan_ctrl.t_now, ptr: state.ptr}
+        {0, 1, 1} -> %{scan: 0, play_ts: state.play_ts, ptr: 0}
+        {0, 1, 0} -> %{scan: state.scan, play_ts: state.play_ts, ptr: add_wrap(state.ptr, 1)}
+        _ -> %{scan: state.scan, play_ts: state.play_ts, ptr: state.ptr}
+      end
+
+    s1_ch_next =
+      match issue do
+        1 -> state.ptr
+        _ -> state.s1_ch
+      end
 
     next_state =
       scan_state
       |> Map.merge(%{
         s1_valid: issue,
-        s1_ch: match_cond([{issue, state.ptr}, {:default, state.s1_ch}]),
+        s1_ch: s1_ch_next,
         out_valid: outputs.out_valid,
         out_ch: outputs.out_ch,
         out_first: outputs.out_first,
@@ -201,10 +207,10 @@ defmodule ExAes67.RTL.JitterBuffer do
     accept = inputs.wr_valid and not state.w_busy
 
     a_addr =
-      match_cond([
-        {state.w_busy, Slots.addr(sl, state.w_ts, state.w_ch)},
-        {:default, Slots.addr(sl, inputs.wr_ts, inputs.wr_ch)}
-      ])
+      match state.w_busy do
+        1 -> Slots.addr(sl, state.w_ts, state.w_ch)
+        _ -> Slots.addr(sl, inputs.wr_ts, inputs.wr_ch)
+      end
 
     a_rd = read_port(mem, addr: a_addr, en: accept, name: :a_rd)
     {sv, stag, _} = Slots.fields(sl, Slots.pick(sl, a_rd, state.w_ch))
@@ -218,37 +224,39 @@ defmodule ExAes67.RTL.JitterBuffer do
     coll = ok and a_addr == scan_ctrl.b_addr
     outputs = %{wr_ready: not state.w_busy}
 
-    next_state =
-      match_cond([
-        {accept,
-         %{
-           w_busy: 1,
-           w_ch: inputs.wr_ch,
-           w_ts: inputs.wr_ts,
-           w_data: as_unsigned(inputs.wr_data)
-         }},
-        {:default,
-         %{
-           w_busy: 0,
-           w_ch: state.w_ch,
-           w_ts: state.w_ts,
-           w_data: state.w_data
-         }}
-      ])
+    next_write =
+      match accept do
+        1 ->
+          %{
+            w_busy: 1,
+            w_ch: inputs.wr_ch,
+            w_ts: inputs.wr_ts,
+            w_data: as_unsigned(inputs.wr_data)
+          }
 
-    {outputs, next_state, events, coll}
+        _ ->
+          %{
+            w_busy: 0,
+            w_ch: state.w_ch,
+            w_ts: state.w_ts,
+            w_data: state.w_data
+          }
+      end
+
+    {outputs, next_write, events, coll}
   end
 
   defp validate_write(state, sv, stag, tag, depth, n, scan_ctrl) do
     playing = state.scan or scan_ctrl.tick_go
     played = not playing or state.w_ch < state.ptr
 
-    floor =
-      add_wrap(
-        match_cond([{state.scan, state.play_ts}, {:default, scan_ctrl.t_now}]),
-        zext(played, 32)
-      )
+    current_ts =
+      match state.scan do
+        1 -> state.play_ts
+        _ -> scan_ctrl.t_now
+      end
 
+    floor = add_wrap(current_ts, zext(played, 32))
     d = as_signed(sub_wrap(state.w_ts, floor))
 
     bad = state.w_ch >= n
@@ -277,10 +285,10 @@ defmodule ExAes67.RTL.JitterBuffer do
       cur = Map.fetch!(state, :"st_#{k}")
 
       next =
-        match_cond([
-          {trigger, add_wrap(cur, 1)},
-          {:default, cur}
-        ])
+        match trigger do
+          1 -> add_wrap(cur, 1)
+          _ -> cur
+        end
 
       {:"st_#{k}", next}
     end
