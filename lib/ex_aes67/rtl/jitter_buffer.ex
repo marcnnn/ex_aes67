@@ -1,7 +1,7 @@
 defmodule ExAes67.RTL.JitterBuffer do
   @moduledoc """
   Timestamp-addressed jitter buffer synthesizing ExAes67.Model.JitterBuffer.
-  Expressed as an idiomatic functional state transformation.
+  Expressed as an idiomatic functional state transformation with function-head pattern matching.
 
   A dual-port RAM stores `channels * depth` audio samples. A write from
   the network computes its slot address from `wr_ts` and `wr_ch`, reads
@@ -150,11 +150,7 @@ defmodule ExAes67.RTL.JitterBuffer do
     is_last = state.ptr == n - 1
     s1_is_last = state.s1_ch == n - 1
 
-    out_data =
-      match {state.s1_valid, hit} do
-        {1, 1} -> bdata
-        _ -> 0
-      end
+    out_data = decode_output(state.s1_valid, hit, bdata)
 
     outputs = %{
       out_valid: state.s1_valid,
@@ -164,19 +160,8 @@ defmodule ExAes67.RTL.JitterBuffer do
       out_data: as_signed(out_data)
     }
 
-    scan_state =
-      match {scan_ctrl.tick_go, issue, is_last} do
-        {1, _, _} -> %{scan: 1, play_ts: scan_ctrl.t_now, ptr: state.ptr}
-        {0, 1, 1} -> %{scan: 0, play_ts: state.play_ts, ptr: 0}
-        {0, 1, 0} -> %{scan: state.scan, play_ts: state.play_ts, ptr: add_wrap(state.ptr, 1)}
-        _ -> %{scan: state.scan, play_ts: state.play_ts, ptr: state.ptr}
-      end
-
-    s1_ch_next =
-      match issue do
-        1 -> state.ptr
-        _ -> state.s1_ch
-      end
+    scan_state = scan_transition(scan_ctrl.tick_go, issue, is_last, scan_ctrl, state)
+    s1_ch_next = next_s1_channel(issue, state.ptr, state.s1_ch)
 
     next_state =
       scan_state
@@ -199,18 +184,40 @@ defmodule ExAes67.RTL.JitterBuffer do
     {outputs, next_state, events}
   end
 
+  # Function-head pattern matching for playout output decoding
+  defpatternp decode_output(s1_valid, hit, bdata) do
+    1, 1, bdata -> bdata
+    _, _, _ -> 0
+  end
+
+  # Function-head pattern matching for scan state transitions
+  defpatternp scan_transition(tick_go, issue, is_last, scan_ctrl, state) do
+    1, _, _, scan_ctrl, state ->
+      %{scan: 1, play_ts: scan_ctrl.t_now, ptr: state.ptr}
+
+    0, 1, 1, _scan_ctrl, _state ->
+      %{scan: 0, play_ts: state.play_ts, ptr: 0}
+
+    0, 1, 0, _scan_ctrl, state ->
+      %{scan: state.scan, play_ts: state.play_ts, ptr: add_wrap(state.ptr, 1)}
+
+    _, _, _, _scan_ctrl, state ->
+      %{scan: state.scan, play_ts: state.play_ts, ptr: state.ptr}
+  end
+
+  # Function-head pattern matching for S1 channel register
+  defpatternp next_s1_channel(issue, ptr, cur_ch) do
+    1, ptr, _cur_ch -> ptr
+    _, _ptr, cur_ch -> cur_ch
+  end
+
   # =========================================================================
   # Write Pipeline Sub-functions (Port A)
   # =========================================================================
 
   defp eval_write(inputs, state, mem, sl, tag, depth, n, scan_ctrl) do
     accept = inputs.wr_valid and not state.w_busy
-
-    a_addr =
-      match state.w_busy do
-        1 -> Slots.addr(sl, state.w_ts, state.w_ch)
-        _ -> Slots.addr(sl, inputs.wr_ts, inputs.wr_ch)
-      end
+    a_addr = select_addr(state.w_busy, state, inputs, sl)
 
     a_rd = read_port(mem, addr: a_addr, en: accept, name: :a_rd)
     {sv, stag, _} = Slots.fields(sl, Slots.pick(sl, a_rd, state.w_ch))
@@ -223,39 +230,41 @@ defmodule ExAes67.RTL.JitterBuffer do
 
     coll = ok and a_addr == scan_ctrl.b_addr
     outputs = %{wr_ready: not state.w_busy}
-
-    next_write =
-      match accept do
-        1 ->
-          %{
-            w_busy: 1,
-            w_ch: inputs.wr_ch,
-            w_ts: inputs.wr_ts,
-            w_data: as_unsigned(inputs.wr_data)
-          }
-
-        _ ->
-          %{
-            w_busy: 0,
-            w_ch: state.w_ch,
-            w_ts: state.w_ts,
-            w_data: state.w_data
-          }
-      end
+    next_write = next_write_state(accept, inputs, state)
 
     {outputs, next_write, events, coll}
+  end
+
+  # Function-head pattern matching for RAM Port A address selection
+  defpatternp select_addr(w_busy, state, inputs, sl) do
+    1, state, _inputs, sl -> Slots.addr(sl, state.w_ts, state.w_ch)
+    _, _state, inputs, sl -> Slots.addr(sl, inputs.wr_ts, inputs.wr_ch)
+  end
+
+  # Function-head pattern matching for write register latch
+  defpatternp next_write_state(accept, inputs, state) do
+    1, inputs, _state ->
+      %{
+        w_busy: 1,
+        w_ch: inputs.wr_ch,
+        w_ts: inputs.wr_ts,
+        w_data: as_unsigned(inputs.wr_data)
+      }
+
+    _, _inputs, state ->
+      %{
+        w_busy: 0,
+        w_ch: state.w_ch,
+        w_ts: state.w_ts,
+        w_data: state.w_data
+      }
   end
 
   defp validate_write(state, sv, stag, tag, depth, n, scan_ctrl) do
     playing = state.scan or scan_ctrl.tick_go
     played = not playing or state.w_ch < state.ptr
 
-    current_ts =
-      match state.scan do
-        1 -> state.play_ts
-        _ -> scan_ctrl.t_now
-      end
-
+    current_ts = select_current_ts(state.scan, state.play_ts, scan_ctrl.t_now)
     floor = add_wrap(current_ts, zext(played, 32))
     d = as_signed(sub_wrap(state.w_ts, floor))
 
@@ -276,6 +285,12 @@ defmodule ExAes67.RTL.JitterBuffer do
     {ok, events}
   end
 
+  # Function-head pattern matching for current timestamp reference
+  defpatternp select_current_ts(scan, play_ts, t_now) do
+    1, play_ts, _t_now -> play_ts
+    _, _play_ts, t_now -> t_now
+  end
+
   # =========================================================================
   # Diagnostic Statistics Reducer
   # =========================================================================
@@ -283,14 +298,13 @@ defmodule ExAes67.RTL.JitterBuffer do
   defp update_metrics(state, events) do
     for {k, trigger} <- events, into: %{} do
       cur = Map.fetch!(state, :"st_#{k}")
-
-      next =
-        match trigger do
-          1 -> add_wrap(cur, 1)
-          _ -> cur
-        end
-
-      {:"st_#{k}", next}
+      {:"st_#{k}", next_metric(trigger, cur)}
     end
+  end
+
+  # Function-head pattern matching for statistic counter update
+  defpatternp next_metric(trigger, cur) do
+    1, cur -> add_wrap(cur, 1)
+    _, cur -> cur
   end
 end
